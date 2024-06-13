@@ -1,0 +1,24 @@
+\usepackage[section]{placeins}
+\usepackage{booktabs}
+
+\frenchspacing %single space between sentences
+
+% define counters for Supplementary Material
+\newcommand{\beginsupplement}{
+\setcounter{table}{0}
+\renewcommand{\thetable}{S\arabic{table}}
+\setcounter{figure}{0}
+\renewcommand{\thefigure}{S\arabic{figure}}
+\setcounter{section}{0}
+\renewcommand{\thesection}{S\arabic{section}}
+}
+
+% settings to be less conservative with float placements
+% https://bookdown.org/yihui/rmarkdown-cookbook/figure-placement.html
+\renewcommand{\topfraction}{.9}
+\renewcommand{\bottomfraction}{.9}
+\renewcommand{\textfraction}{.1}
+\renewcommand{\floatpagefraction}{.8}
+\setcounter{topnumber}{5}
+\setcounter{bottomnumber}{5}
+\setcounter{totalnumber}{5}

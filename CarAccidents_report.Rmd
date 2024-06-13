@@ -1,0 +1,1114 @@
+---
+title: "Assessing the Impact of Marijuana Decriminalization on Vehicle Accident Experience"
+author: 
+  - Vyacheslav Lyubchich^[Email lyubchich@umces.edu] 
+date: "2024-06-13"
+output: 
+  bookdown::pdf_document2: 
+    # toc: true
+    # toc_depth: 3
+    # number_sections: true
+    toc: true
+    toc_depth: 3
+    number_sections: yes
+    fig_caption: true
+    global_numbering: true
+    includes:
+      in_header: "preamble.tex"
+fontsize: 12pt
+bibliography: 
+ - refPackages.bib
+ - ref_trafficCAUS.bib
+csl: springer-basicVL.csl
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, 
+                      fig.height = 3.5, fig.width = 8,
+                      message = FALSE, warning = FALSE)
+knitr::opts_knit$set(eval.after = "fig.cap")
+options(digits = 5)
+```
+
+```{r packages, include=FALSE}
+rm(list = ls())
+library(boot)
+# library(boot.pval)
+library(car)
+library(cobalt)
+library(dplyr)
+library(MatchIt)
+library(readxl)
+library(tidyr)
+library(lmeresampler)
+library(nlme)
+library(ranger); library(randomForest)
+library(pdp)
+library(ICEbox)
+library(caret)
+library(Boruta)
+# packages for plotting
+library(ggplot2)
+library(gridExtra)
+library(hrbrthemes)
+library(viridis)
+library(patchwork)
+library(plot.matrix)
+library(Cairo)
+extrafont::loadfonts()
+library(scales) # ggplot time axis labels
+library(zoo) # ggplot time axis labels
+library(xtable)
+library(flextable)
+library(tibble)
+library(officer)
+# library(pdp)
+
+# https://stackoverflow.com/questions/31198144/formatting-a-scale-x-continuous-axis-with-quarterly-data
+format_quarters <- function(x) {
+    x <- as.yearqtr(x)
+    year <- as.integer(x)
+    quart <- as.integer(format(x, "%q"))
+    # paste(c("Jan-Mar","Apr-Jun","Jul-Sep","Oct-Dec")[quart], year)
+    paste0(year, " Q", quart)
+}
+format_months <- function(x) {
+    year <- format(x, "%Y")
+    mon <- format(x, "%m")
+    paste0(year, "-", mon)
+}
+```
+
+\tableofcontents
+
+
+# Data overview
+
+## Canada {#sec:dataCanada}
+
+```{r}
+DateCEffect <- as.Date("2018-10-17") # date of effect in Canada
+DateCovid <- as.Date("2020-01-01") # date of start of COVID-19 impacts
+DateCStart <- as.Date("2016-01-01") # date of start of analysis for Canada
+YearCEffect <- as.numeric(format(DateCEffect, "%Y"))
+YearCovid <- as.numeric(format(DateCovid, "%Y"))
+YearCStart <- as.numeric(format(DateCStart, "%Y"))
+YearCPI <- 2019L # year for price adjustments
+BAlevels <- c("Before", "After") # how periods will be labeled
+```
+
+The legalization of recreational use of marijuana took effect across Canada on `r DateCEffect`.[^1]
+
+[^1]: <https://www.sencanada.ca/en/sencaplus/news/cannabis-act> (accessed 2021-07-11)
+
+The data used in this study come from annual reports of the General Insurance Statistical Agency[^3] (GISA) which collects insurance information from most Canadian regions (except British Columbia, Manitoba, Quebec, and Saskatchewan; Exhibits AUTO1003, AUTO1005, and AUTO1010), and Groupement des Assureurs Automobiles[^4] (GAA) that provides the information for Quebec (Exhibit 1A.2). 
+From these reports, information on the *collision of private vehicles* per accident year was extracted. 
+
+The claims in this category are characterized by loss development factors close to 1, hence are not expected to change substantially as the losses from accidents that happened in the most recent years get finalized. 
+Dollar amounts were adjusted to the prices of `r YearCPI` to account for the changing value of money, using the consumer price index (all item groups) by Statistics Canada.[^5]
+
+[^3]: <https://www.gisa.ca/> (accessed 2021-07-01)
+
+[^4]: <https://gaa.qc.ca/en/statistics/at-a-glance/> (accessed 2021-07-01)
+
+[^5]: Statistics Canada. Table 18-10-0005-01 Consumer Price Index, annual average, not seasonally adjusted <https://doi.org/10.25318/1810000501-eng> (release date 2021-01-20)
+
+Figure \@ref(fig:GISAact-plot) shows the dynamics of the studied variables by region. The regions differ in population, hence the annual number of earned vehicles was used to weight the observations in further analyses (Figure \@ref(fig:Wreg-plot)).
+
+```{r}
+# loss development factors
+GISAldf <- readxl::read_excel("dataraw/Canada_GISA.xlsx", sheet = "loss development factors") 
+GISAldf$AccPeriod <- as.Date(GISAldf$AccPeriod) 
+GISAldf <- GISAldf %>% 
+    select(DataType, Province, AccPeriod, Collision) %>% 
+    filter(DateCStart <= AccPeriod & AccPeriod < DateCovid)
+# long format
+GISAldf_l <- GISAldf %>% pivot_longer(-c(DataType, Province, AccPeriod), 
+                                      names_to = "Category", 
+                                      values_to = "Value")
+```
+
+```{r}
+# CPI is to the basis of 2002 (2002 = 100%)
+Ccpi <- read.csv("dataraw/Canada_other/1810000501_databaseLoadingData.csv")
+names(Ccpi)[1] <- "Year"
+# select the index category and recalculate to a recent year, such as 2020
+Ccpi <- Ccpi %>% 
+    filter(Products.and.product.groups == "All-items") %>% 
+    select(Year, VALUE) %>% 
+    mutate(CPIrec = VALUE[Year == YearCPI] / VALUE) %>% 
+    select(Year, CPIrec)
+```
+
+```{r}
+# actual data
+GISAact <- readxl::read_excel("dataraw/Canada_GISA.xlsx", sheet = "actual") 
+GISAact <- GISAact %>% 
+    filter(YearCStart <= Year & Year < YearCovid) %>% 
+    left_join(Ccpi, by = "Year") %>% 
+    mutate(AvgCostPerClaim = AvgCostPerClaim * CPIrec) # adjust to recent prices
+# long format
+GISAact_l <- GISAact %>% 
+    select(!CPIrec) %>% 
+    pivot_longer(-c(DataType, Province, Year, NEarnedVehicles), 
+                 names_to = "Variable", 
+                 values_to = "Value") 
+GISAact$BA <- NA
+GISAact$BA[GISAact$Year < YearCEffect] <- BAlevels[1]
+GISAact$BA[GISAact$Year > YearCEffect] <- BAlevels[2]
+GISAact$BA <- factor(GISAact$BA, levels = BAlevels)
+```
+
+```{r}
+GISAact %>% 
+  dplyr::select(Province, NEarnedVehicles,
+                ClaimFreqPer100EarnedVehicles, AvgCostPerClaim) %>% 
+  psych::describeBy(group = GISAact$Province, mat = F, fast = TRUE)
+```
+
+
+```{r}
+# actual QC data
+QCact <- readxl::read_excel("dataraw/Canada_GISA.xlsx", sheet = "QC")
+QCact <- QCact %>% 
+    filter(YearCStart <= Year & Year < YearCovid) %>% 
+    left_join(Ccpi, by = "Year") %>% 
+    # adjust to recent prices
+    mutate(AvgCostPerClaim = AvgCostPerClaim * CPIrec) %>% 
+    # https://stackoverflow.com/questions/31071733/convert-quarter-year-format-to-a-date
+    mutate(Period = paste(Year, Quarter, sep = " Q")) %>% 
+    mutate(PeriodEnd = as.Date(as.yearqtr(Period, format = "%Y Q%q"), frac = 1)) %>% 
+    mutate(PeriodStart = as.Date(as.yearqtr(Period, format = "%Y Q%q"))) %>% 
+    mutate(Quarter = factor(Quarter))
+QCact$BA <- NA
+QCact$BA[QCact$PeriodEnd < DateCEffect] <- BAlevels[1]
+QCact$BA[QCact$PeriodEnd > DateCEffect] <- BAlevels[2]
+QCact$BA <- factor(QCact$BA, levels = BAlevels)
+# long format
+QCact_l <- QCact %>% 
+    select(!CPIrec) %>% 
+    pivot_longer(-c(DataType, Province, Year, Quarter, NEarnedVehicles, 
+                    Period, PeriodEnd, PeriodStart, BA), 
+                 names_to = "Variable", 
+                 values_to = "Value") 
+```
+
+
+```{r GISAact-plot, fig.cap = paste("Annual average cost per claim (in", YearCPI, "dollars) and frequency of collisions. The dashed line denotes the year of marijuana decriminalization.")}
+GISAact_l$Province <- factor(GISAact_l$Province)
+GISAact_l %>% 
+    ggplot() +
+    aes(x = Year, y = Value, group = paste0(Province, Variable), color = Province, shape = Province) +
+    scale_shape_manual(values = 1:nlevels(GISAact_l$Province)) + 
+    geom_line(lwd = 1) + geom_point() + 
+    facet_wrap(~Variable, scales = "free") +
+    labs(x = "", y = "") +
+    theme_minimal() +
+    scale_color_viridis(discrete = TRUE) +
+    geom_vline(xintercept = YearCEffect, color = "gray50", linetype = "dashed")
+```
+
+
+```{r Wreg-plot, fig.cap = paste0("Number of earned vehicles during ", min(GISAact$Year), "--", max(GISAact$Year), " used as the regional weights. The lower and upper hinges correspond to the first and third quartiles."), fig.height=5}
+# Barplot: average number of vehicles used as weights
+Wreg <- GISAact %>%
+    group_by(DataType, Province) %>%
+    summarise(W = mean(NEarnedVehicles)) %>%
+    mutate(Wpct = round(100 * W / sum(W), 1))
+Wp <- formatC(Wreg$Wpct, format = "f", digits = 1)
+# Boxplot: without averaging
+GISAact %>% 
+    ggplot(aes(x = Province, y = NEarnedVehicles/1000L)) + 
+    scale_x_discrete(labels = paste0(Wreg$Province, "\n(", Wp, ")")) + 
+    geom_boxplot() +
+    labs(x = "Province and average relative weight (%)", 
+         y = "Number of earned vehicles (thousands)") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1.1))
+```
+
+
+```{r QCact-plot, fig.cap = paste("Quarterly average cost per claim (in", YearCPI, "dollars) and frequency of collisions in Quebec. The dashed line denotes the date of marijuana decriminalization.")}
+p1 <- QCact_l %>% 
+    filter(Variable == "AvgCostPerClaim") %>% 
+    ggplot() +
+    aes(x = PeriodEnd, y = Value) +
+    geom_line(lwd = 1) + geom_point() + ylim(3750, 5750) +
+    labs(x = "", y = paste0("Cost per claim (", YearCPI, " dollars)")) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, vjust = 0.5),
+          panel.grid.minor.x = element_blank()) +
+    geom_vline(xintercept = DateCEffect, color = "gray50", linetype = "dashed") +
+    scale_x_date("",
+                 breaks = breaks_width("6 months", offset = -1),
+                 labels = format_quarters)
+p2 <- QCact_l %>% 
+    filter(Variable == "ClaimFreqPer100EarnedVehicles") %>% 
+    ggplot() +
+    aes(x = PeriodEnd, y = Value) +
+    geom_line(lwd = 1) + geom_point() + ylim(3.5, 6.5) +
+    labs(x = "", y = "Claim frequency per 100 vehicles") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, vjust = 0.5),
+          panel.grid.minor.x = element_blank()) +
+    geom_vline(xintercept = DateCEffect, color = "gray50", linetype = "dashed") +
+    scale_x_date("",
+                 breaks = breaks_width("6 months", offset = -1),
+                 labels = format_quarters)
+p1 + p2
+```
+
+
+\FloatBarrier
+
+## United States {#sec:dataUS}
+
+```{r}
+DateUSAStart <- as.Date("2016-03-01") # date of start of weather data for USA (end will be cut with DateCovid)
+YearDateUSAStart <- as.numeric(format(DateUSAStart, "%Y"))
+```
+
+```{r}
+StateStat <- read_excel("dataraw/USA_statestats.xlsx", sheet = "Sheet1") %>% 
+    select(-(starts_with("check")))
+```
+
+The following state statistics were used to select the control group states: urbanization (percentage of the total population)[^6], population[^7], vehicle miles per licensed driver$^7$, road miles per 1000 persons (calculated as the total road and street mileage divided by the population)$^7$, and vehicles per 1000 people[^8]. Number of licensed drivers was also considered, but correlated too strongly ($r = 0.99$) with population.
+
+[^6]: https://en.wikipedia.org/wiki/Urbanization_in_the_United_States (accessed 2021-11-01)
+[^7]: https://www.fhwa.dot.gov/ohim/onh00/onh2p11.htm (accessed 2021-12-25)
+[^8]: https://en.wikipedia.org/wiki/List_of_U.S._states_by_vehicles_per_capita (accessed 2021-11-01)
+
+Air temperature and precipitation information was obtained from two alternative sources:
+
+1. Hourly data were obtained from the US ASOS network of automated airport weather observations[^9], using airport codes from the CTAD. In the cases when an airport from CTAD could not be found, its location was approximated using latitudes and longitudes of reported accidents, and geodesic distances were used to replace the missing airport with a nearby airport represented in the ASOS database.
+2. Daily gridded data from Daymet[^10], where grid cells were selected based on coordinates of airport weather stations in the ASOS network.
+
+[^9]: https://mesonet.agron.iastate.edu/request/download.phtml?network=AWOS
+[^10]: Daymet: Daily Surface Weather Data on a 1-km Grid for North America, Version 4 https://doi.org/10.3334/ORNLDAAC/1840
+
+The Fatality Analysis Reporting System (FARS)[^11] of the National Highway Traffic Safety Administration (NHTSA) of the United States Department of Transportation was used to extract accident data for this study. 
+
+[^11]: <https://www.nhtsa.gov/research-data/fatality-analysis-reporting-system-fars> (accessed 2021-07-01)
+
+The database was supplemented with such variables as 
+Year (numeric), 
+Month (1--12, categorical), 
+Weekday (1--7, categorical),
+Weekend (0/1, categorical),
+Holiday [0/1, categorical, based on @R-timeDate holiday calendar for the New York Stock Exchange].
+
+The accident experience metrics were normalized by the number of registered vehicles by year and state, available from https://www.fhwa.dot.gov.
+
+```{r}
+Groups <- c("Legalized", "Fully illegal", "Illegal recreational", 
+            "Legalized after the study period", "Mixed (unused in the study)")
+USAm <- read_excel("dataraw/USA_cannabis.xlsx", skip = 1) %>% 
+    mutate(Date0 = as.Date(Date0),
+           DateLegalEffect = as.Date(DateLegalEffect),
+           DateSalesEffect = as.Date(DateSalesEffect))
+# select states that legalized during the period start--covid
+# except Alaska because not in the other data
+# except Michigan because legalized too late in the analyzed period
+states1 <- USAm %>% 
+    filter(DateUSAStart <= DateSalesEffect & DateSalesEffect < DateCovid) %>% 
+    filter(State != "AK") %>% 
+    filter(State != "MI") %>%   
+    mutate(Legal = 1,
+           Group = Groups[1])
+
+# select states that can be used as controls
+## fully illegal
+states0_1 <- USAm %>% 
+    filter(`Legal Status` == "Fully Illegal") %>% 
+    mutate(Legal = 0,
+           Group = Groups[2])
+## medicinal is OK but recreational is strictly no, exclude states that allow in some parts
+states0_2 <- USAm %>% 
+    filter(grepl("Mixed", `Legal Status`) & Decriminalized == "No" & is.na(Notes)) %>% 
+    mutate(Legal = 0,
+           Group = Groups[3])
+## legalized after the period of consideration start--covid
+states0_3 <- USAm %>% 
+    filter(grepl("Fully Legal", `Legal Status`) & DateLegalEffect > DateCovid) %>% 
+    mutate(Legal = 0,
+           Group = Groups[4])
+
+# remaining states that were not included into the 1/0 groups
+USAm2 <- dplyr::bind_rows(states1, 
+                          states0_1, states0_2, states0_3)
+unused <- setdiff(USAm$State, USAm2$State)
+statesX <- USAm %>%
+    filter(is.element(State, unused)) %>% 
+    mutate(Legal = NA,
+           Group = Groups[5])
+USAm2 <- dplyr::bind_rows(USAm2, statesX)
+saveRDS(USAm2, "./dataderived/USA_legalgrouped.rds")
+```
+
+
+```{r}
+# create a matrix showing times of legalization by state
+States <- USAm2$State
+StatesEffect <- USAm2[!is.na(USAm2$DateSalesEffect),]
+DateRange <- seq.Date(from = DateUSAStart, to = DateCovid - 1, by = "month")
+DateRangeC <- as.character(DateRange) %>% substr( 1, 7)
+M_DateEffect <- matrix(FALSE, nrow = length(States), ncol = length(DateRange),
+                       dimnames = list(States, DateRangeC))
+for (i in 1:nrow(StatesEffect)) { # i = 7
+    state <- StatesEffect$State[i]
+    de <- StatesEffect$DateSalesEffect[i]
+    # cut the date to 1st of the month
+    de <- as.Date(paste0(format(de, "%Y-%m"), "-01"))
+    M_DateEffect[state, DateRange >= de] <- TRUE
+}
+```
+
+
+```{r}
+TableData = data.frame(Group = c("Legalized", 
+                                 "Fully illegal", 
+                                 "Illegal recreational", 
+                                 "Legalized after the study period", "Mixed (unused in the study)"),
+                       States = c("CA (2018-01-01), MA (2018-11-20), NV (2017-07-01)",
+                                  "ID, KS, NE, NC, SC, TN, WY",
+                                  "AL, AR, FL, IN, IA, KY, OK, TX, UT, WV, WI",
+                                  "AZ, MT, NJ, NY, SD, VA",
+                                  "AK, CO, CT, DE, DC, GA, HI, IL, LA, ME, MD, MI, MN, MS, MO, NH, NM, ND, OH, OR, PA, RI, VT, WA"))
+
+TableData %>% 
+  # as.data.frame() %>% 
+  # rownames_to_column() %>% 
+  flextable() %>% 
+  autofit() %>% 
+  set_caption("Groups of states for studying the cannabis legalization in the United States (from 2016-03 to 2019-12). The dates when the commercial sales started are used in analysis and are shown in parentheses.", 
+  autonum = run_autonum(seq_id = "tab", bkm = "DateEffect"))
+```
+
+
+```{r DateEffect-plot, fig.cap = paste0("Cannabis legalization in the United States (from ", DateRangeC[1], " to ", DateRangeC[length(DateRangeC)], "). Green shows the times after the commercial sales started."), fig.height=7}
+par(mar = c(0, 1, 3, 0) + 0.1,
+    mgp = c(2, 0.2, 0))
+plot(M_DateEffect,
+     key = NULL, border = NA,
+     axis.col = list(side = 3, las = 2, font = 1, tick = FALSE), # dates
+     axis.row = list(side = 2, las = 1, font = 1, tick = FALSE), # states
+     cex.main = 1, cex.lab = 1, cex.axis = 0.6,
+     xlab = "", ylab = "", main = "",
+     col = c("white", "green3"))
+# separate the groups
+gr <- cumsum(c(nrow(statesX), nrow(states0_3), nrow(states0_2), nrow(states0_1)))
+abline(h = gr + 0.5, lty = 2)
+text(x = 2, y = c(gr, nrow(M_DateEffect)) - 1, adj = 0, labels = rev(Groups))
+```
+
+
+
+# Methods {#sec:methods}
+
+```{r}
+alpha = 0.05
+B = 1000L
+TYPE = c("basic", "perc", "norm")
+```
+
+Use two-tailed tests with significance level $\alpha$ = `r alpha` unless noted otherwise ($1 - \alpha$ = `r 1 - alpha` or `r 100*(1 - alpha)`% corresponds to the confidence level). In other words, the results are statistically significant when the corresponding $p$-values are below $\alpha$.
+
+The analysis is done in R [@R-base].
+
+
+# Results
+
+```{r}
+meanFun <- function(x, i) {mean(x[i])}
+medianFun <- function(x, i) {median(x[i])}
+
+if (FALSE) {
+    D = na.omit(GISAact)
+    x = "BA"
+    y = "AvgCostPerClaim"
+    # y = "ClaimFreqPer100EarnedVehicles"
+    region = "Province"
+    w = "NEarnedVehicles"
+    B = 1000L; conf = 0.95; type = c("norm", "basic", "perc", "bca")
+    ScaleByRegion = CenterByRegion = FALSE
+    cor = FALSE; plotit = FALSE
+}
+BA_test <- function(D, x = "BA", y, region = "Province", w = NULL, 
+                    cor = FALSE, plotit = FALSE,
+                    CenterByRegion = FALSE, ScaleByRegion = FALSE,
+                    B = 1000L, conf = c(0.9, 0.95), 
+                    type = c("norm", "basic", "perc", "bca"))
+{
+    # general manipulations
+    alpha <- 1 - conf
+    D <- tibble(Y = unlist(D[,y]), 
+                X = unlist(D[,x]), 
+                W = unlist(D[,w]), 
+                Year = unlist(D[,"Year"]),
+                Region = unlist(D[,region]))
+    
+    # scale data within each region
+    if (CenterByRegion || ScaleByRegion) {
+        D <- D %>% 
+            group_by(Region) %>% 
+            mutate(Y = scale(Y, center = CenterByRegion, scale = ScaleByRegion))
+    }
+    
+    # parametric approach
+    if (!is.null(w)) {
+        vf <- nlme::varPower(form = ~1/W) # lower AIC than other vf structures.
+        if (cor) {
+            m0 <- nlme::lme(Y ~ X, random = ~1|Region, weights = vf, method = "REML", 
+                            correlation = nlme::corARMA(p = 1, form = ~Year|Region),
+                            data = D)
+        } else { # use trend instead of autocorrelation
+            m0 <- nlme::lme(Y ~ X + Year, random = ~1|Region, weights = vf, method = "REML", data = D)
+            # summary(m0)
+        }
+    } else {
+        if (cor) {
+            m0 <- nlme::lme(Y ~ X, random = ~1|Region, method = "REML", 
+                            correlation = nlme::corARMA(p = 1, form = ~Year|Region),
+                            data = D)
+        } else {
+            m0 <- nlme::lme(Y ~ X + Year, random = ~1|Region, method = "REML", data = D)
+        }
+    }
+    m0_fixeff <- summary(m0)$tTable[-1, , drop = FALSE]
+    m0_pv <- m0_fixeff[,ncol(m0_fixeff)]
+    
+    # LME bootstrap
+    boo <- lmeresampler::bootstrap(model = m0, .f = fixed.effects, 
+                                   type = "residual",
+                                   # type = "parametric",
+                                   # type = "reb",
+                                   # type = "wild", hccme = "hc2", aux.dist = "f1",
+                                   B = B)
+    # print(boo)
+    if (plotit) {
+        p <- plot(boo, 2) + theme_minimal() + ggtitle("")
+        print(p)
+    }
+    BootMeans <- confint(boo, level = 1 - alpha) %>% 
+        filter(term == "XAfter")
+    
+    # output results
+    list(ParametricLME = m0_fixeff
+         ,BootMeans = BootMeans
+    )
+}
+```
+
+
+## Canada
+
+In this section, the number of earned vehicles per region (Figure \@ref(fig:Wreg-plot)) was used as the weights.
+
+
+### Average cost per claim 
+
+Results for the average cost per claim are as follows. 
+The $p$-value for the effect of marijuana decriminalization in Canada in the mixed-effects model is above the significance level (Table \@ref(tab:BA-Cost-par)), which implies there is not enough evidence of the decriminalization effect.
+The bootstrap distribution for this parameter has its center close to zero (Figure \@ref(fig:BA-Cost)) and all versions of the confidence intervals contain zero (Table \@ref(tab:BA-Cost-boot)) implying no significant effects.
+
+```{r BA-Cost, cache=TRUE, fig.cap = "Density plot of the bootstrap distribution of coefficient $b$ in the mixed-effects model of the effect of marijuana decriminalization on the average cost per claim in Canada. The horizontal lines correspond to 66% and 95% confidence."}
+set.seed(456)
+tmp <- BA_test(na.omit(GISAact), x = "BA", y = "AvgCostPerClaim", 
+               region = "Province", w = "NEarnedVehicles", 
+               plotit = TRUE, type = TYPE,
+               B = B, conf = 1 - alpha)
+```
+
+
+```{r}
+tmp$ParametricLME %>% 
+  as.data.frame() %>% 
+  rownames_to_column() %>% 
+  flextable() %>% 
+  autofit() %>% 
+  set_caption("Parametric estimates from the mixed effects model of the effect of marijuana decriminalization on the average cost per claim in Canada", 
+  autonum = run_autonum(seq_id = "tab", bkm = "BA-Cost-par"))
+```
+
+
+```{r}
+tmp$BootMeans %>% 
+  as.data.frame() %>% 
+  rownames_to_column() %>% 
+  flextable() %>% 
+  autofit() %>% 
+  set_caption("Bootstrap confidence intervals for the coefficient $b$ in the mixed-effects model of the effect of marijuana decriminalization on the average cost per claim in Canada", 
+  autonum = run_autonum(seq_id = "tab", bkm = "BA-Cost-boot"))
+```
+
+
+### Claim frequency
+
+Results for the claim frequency per 100 earned vehicles lead to the same conclusions as do the results for the average cost per claim presented in the previous section. 
+Specifically, the $p$-value for the effect of marijuana decriminalization in Canada in the mixed-effects model is above the significance level (Table \@ref(tab:BA-ClaimFreq-par)), which implies there is not enough evidence of the decriminalization effect.
+The bootstrap distribution for this parameter has its center close to zero (Figure \@ref(fig:BA-ClaimFreq)) and all versions of the confidence intervals contain zero (Table \@ref(tab:BA-ClaimFreq-boot)) implying no significant effects.
+
+```{r BA-ClaimFreq, cache=TRUE, fig.cap = "Density plot of the bootstrap distribution of coefficient $b$ in the mixed-effects model of the effect of marijuana decriminalization on the claim frequency in Canada. The horizontal lines correspond to 66% and 95% confidence."}
+set.seed(123)
+tmp <- BA_test(na.omit(GISAact), x = "BA", y = "ClaimFreqPer100EarnedVehicles", 
+               region = "Province", w = "NEarnedVehicles", 
+               plotit = TRUE, type = TYPE,
+               B = B, conf = 1 - alpha)
+```
+
+
+```{r}
+tmp$ParametricLME %>% 
+  as.data.frame() %>% 
+  rownames_to_column() %>% 
+  flextable() %>% 
+  autofit() %>% 
+  set_caption("Parametric estimates from the mixed-effects model of the effect of marijuana decriminalization on the claim frequency in Canada", 
+  autonum = run_autonum(seq_id = "tab", bkm = "BA-ClaimFreq-par"))
+```
+
+
+```{r}
+tmp$BootMeans %>% 
+  as.data.frame() %>% 
+  rownames_to_column() %>% 
+  flextable() %>% 
+  autofit() %>% 
+  set_caption("Bootstrap confidence intervals for the coefficient $b$ in the mixed-effects model of the effect of marijuana decriminalization on the claim frequency in Canada", 
+  autonum = run_autonum(seq_id = "tab", bkm = "BA-ClaimFreq-boot"))
+```
+
+
+\FloatBarrier
+### Quebec average cost per claim {#sec:mQCcost}
+
+Here model \@ref(eq:BAs) is applied to quarterly average costs per claim in Quebec.
+With the observed trend and seasonality, there is not enough evidence of changing average costs after the marijuana decriminalization (Table \@ref(tab:mQCcost), $p$-value above `r alpha`). 
+See the fit of this model in Figure \@ref(fig:mQCcost); all observed values belong to the `r 100*(1 - alpha)`% prediction interval.
+
+```{r}
+mQCcost <- lm(AvgCostPerClaim ~ BA + Year + Quarter, 
+              # weights = NEarnedVehicles,
+              data = QCact)
+mQCcost_fit <- predict(mQCcost, interval = "prediction", level = 1 - alpha)
+# summary(mQCcost)
+```
+
+
+```{r}
+summary(mQCcost)$coefficients %>% 
+  as.data.frame() %>% 
+  rownames_to_column() %>% 
+  flextable() %>% 
+  autofit() %>% 
+  set_caption("Results of estimating the effect of marijuana decriminalization on average cost per claim in Quebec within a trend-seasonal model", 
+  autonum = run_autonum(seq_id = "tab", bkm = "mQCcost"))
+```
+
+```{r mQCcost, fig.cap = paste("Quarterly average cost per claim (in", YearCPI, "dollars) in Quebec. Black are the observed values, blue are the fitted values and", 100*(1 - alpha), "percent prediction intervals. The dashed line denotes the date of marijuana decriminalization.")}
+QCact_l %>% 
+    filter(Variable == "AvgCostPerClaim") %>% 
+    ggplot() +
+    aes(x = PeriodEnd, y = Value) +
+    geom_line(aes(y = mQCcost_fit[,1]), lwd = 1.5, color = "cornflowerblue") +
+    geom_ribbon(aes(ymin = mQCcost_fit[,2], ymax = mQCcost_fit[,3]), 
+                fill = "cornflowerblue", alpha = 0.4) +
+    geom_line(lwd = 1) + geom_point() + 
+    labs(x = "", y = paste0("Cost per claim (", YearCPI, " dollars)")) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, vjust = 0.5),
+          panel.grid.minor.x = element_blank()) +
+    geom_vline(xintercept = DateCEffect, color = "gray50", linetype = "dashed") +
+    scale_x_date("",
+                 breaks = breaks_width("6 months", offset = -1),
+                 labels = format_quarters)
+```
+
+
+```{r BA-Cost-QC, cache=TRUE, fig.height = 4.5, fig.cap = "Density plot of the bootstrap distribution of coefficient $b$ in the linear model of the effect of marijuana decriminalization on the average cost per claim in Quebec."}
+boo <- car::Boot(mQCcost, R = B, method = "residual")
+# summary(boo)
+# confint(boo, type = "perc") # ?car:::confint.boot
+par(mar = c(4, 4, 4, 1) + 0.1)
+hist(boo, 2, level = 1 - alpha, ci = "perc", las = 1)
+```
+
+Figure \@ref(fig:BA-Cost-QC) shows the bootstrap distribution of the parameter with a percentile interval. All versions of the 95% intervals contain zero, hence there is not enough evidence of the decriminalization effect: normal interval (-170.50, 190.57), basic interval (-160.59, 193.20), and percentile interval (-167.55, 186.24).
+
+
+Additionally, a restricted model (without the indicator variable representing the periods Before/After)
+\begin{equation}
+y_{t'} = a + c t' + \sum_{i = 1}^{s-1}d_i S_{it'} + e_{t'}
+\end{equation}
+was estimated on $t'$ before the decriminalization date and similar outputs were obtained from this model (Table \@ref(tab:mQCcost0), Figure \@ref(fig:mQCcost0)). Figure \@ref(fig:mQCcost0) shows that before-decriminalization trends extended in the future can accurately predict the average costs per claim, without modeling the effect of decriminalization.
+
+```{r}
+mQCcost0 <- lm(AvgCostPerClaim ~ Year + Quarter, 
+               # weights = NEarnedVehicles,
+               data = QCact[QCact$PeriodEnd <= DateCEffect,])
+mQCcost0_fit <- predict(mQCcost0, interval = "prediction", level = 1 - alpha, newdata = QCact)
+# summary(mQCcost0)
+```
+
+
+```{r}
+summary(mQCcost0)$coefficients %>% 
+  as.data.frame() %>% 
+  rownames_to_column() %>% 
+  flextable() %>% 
+  autofit() %>% 
+  set_caption("Results of estimating the restricted trend-seasonal model for average cost per claim in Quebec, using the data before decriminalization", 
+  autonum = run_autonum(seq_id = "tab", bkm = "mQCcost0"))
+```
+
+
+
+```{r mQCcost0, fig.cap = paste("Quarterly average cost per claim (in", YearCPI, "dollars) in Quebec. Black are the observed values, blue are the fitted values (restricted trend-seasonal model based on the data before decriminalization) and", 100*(1 - alpha), "percent prediction intervals. The dashed line denotes the date of marijuana decriminalization.")}
+QCact_l %>% 
+    filter(Variable == "AvgCostPerClaim") %>% 
+    ggplot() +
+    aes(x = PeriodEnd, y = Value) +
+    geom_line(aes(y = mQCcost0_fit[,1]), lwd = 1.5, color = "cornflowerblue") +
+    geom_ribbon(aes(ymin = mQCcost0_fit[,2], ymax = mQCcost0_fit[,3]), 
+                fill = "cornflowerblue", alpha = 0.4) +
+    geom_line(lwd = 1) + geom_point() + 
+    labs(x = "", y = paste0("Cost per claim (", YearCPI, " dollars)")) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, vjust = 0.5),
+          panel.grid.minor.x = element_blank()) +
+    geom_vline(xintercept = DateCEffect, color = "gray50", linetype = "dashed") +
+    scale_x_date("",
+                 breaks = breaks_width("6 months", offset = -1),
+                 labels = format_quarters)
+```
+
+
+\FloatBarrier
+### Quebec claim frequency {#sec:mQCfreq}
+
+```{r}
+mQCfreq <- lm(ClaimFreqPer100EarnedVehicles ~ BA + Year + Quarter, 
+              # weights = NEarnedVehicles,
+              data = QCact)
+mQCfreq_fit <- predict(mQCfreq, interval = "prediction", level = 1 - alpha)
+# summary(mQCfreq)
+```
+
+
+```{r, results='asis', message=FALSE, warning=FALSE}
+print(xtable(mQCfreq, 
+             caption = "Results of estimating the effect of marijuana decriminalization on claim frequency in Quebec within a trend-seasonal model", 
+             label = "tab:mQCfreq"), 
+      comment = FALSE, caption.placement = "top")
+```
+
+```{r}
+summary(mQCfreq)$coefficients %>% 
+  as.data.frame() %>% 
+  rownames_to_column() %>% 
+  flextable() %>% 
+  autofit() %>% 
+  set_caption("Results of estimating the effect of marijuana decriminalization on claim frequency in Quebec within a trend-seasonal model", 
+  autonum = run_autonum(seq_id = "tab", bkm = "mQCfreq"))
+```
+
+
+```{r mQCfreq, fig.cap = paste("Quarterly claim frequency per 100 earned vehicles in Quebec. Black are the observed values, blue are the fitted values and", 100*(1 - alpha), "percent prediction intervals. The dashed line denotes the date of marijuana decriminalization.")}
+QCact_l %>% 
+    filter(Variable == "ClaimFreqPer100EarnedVehicles") %>% 
+    ggplot() +
+    aes(x = PeriodEnd, y = Value) +
+    geom_line(aes(y = mQCfreq_fit[,1]), lwd = 1.5, color = "cornflowerblue") +
+    geom_ribbon(aes(ymin = mQCfreq_fit[,2], ymax = mQCfreq_fit[,3]), 
+                fill = "cornflowerblue", alpha = 0.4) +
+    geom_line(lwd = 1) + geom_point() + 
+    labs(x = "", y = "Claim frequency per 100 vehicles") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, vjust = 0.5),
+          panel.grid.minor.x = element_blank()) +
+    geom_vline(xintercept = DateCEffect, color = "gray50", linetype = "dashed") +
+    scale_x_date("",
+                 breaks = breaks_width("6 months", offset = -1),
+                 labels = format_quarters)
+```
+
+
+```{r BA-freq-QC, cache=TRUE, fig.height = 4.5, fig.cap = "Density plot of the bootstrap distribution of coefficient $b$ in the linear model of the effect of marijuana decriminalization on the average cost per claim in Quebec."}
+boo <- car::Boot(mQCfreq, R = B, method = "residual")
+# summary(boo)
+# confint(boo, type = "perc") # ?car:::confint.boot
+par(mar = c(4, 4, 4, 1) + 0.1)
+hist(boo, 2, level = 1 - alpha, ci = "perc", las = 1)
+```
+
+
+```{r}
+mQCfreq0 <- lm(ClaimFreqPer100EarnedVehicles ~ Year + Quarter, 
+               # weights = NEarnedVehicles,
+               data = QCact[QCact$PeriodEnd <= DateCEffect,])
+mQCfreq0_fit <- predict(mQCfreq0, interval = "prediction", level = 1 - alpha, newdata = QCact)
+# summary(mQCfreq0)
+```
+
+
+```{r}
+summary(mQCfreq0)$coefficients %>% 
+  as.data.frame() %>% 
+  rownames_to_column() %>% 
+  flextable() %>% 
+  autofit() %>% 
+  set_caption("Results of estimating the restricted trend-seasonal model for claim frequency per 100 earned vehicles in Quebec, using the data before decriminalization", 
+  autonum = run_autonum(seq_id = "tab", bkm = "mQCfreq0"))
+```
+
+
+```{r mQCfreq0, fig.cap = paste("Quarterly claim frequency per 100 earned vehicles in Quebec. Black are the observed values, blue are the fitted values (restricted trend-seasonal model based on the data before decriminalization) and", 100*(1 - alpha), "percent prediction intervals. The dashed line denotes the date of marijuana decriminalization.")}
+QCact_l %>% 
+    filter(Variable == "ClaimFreqPer100EarnedVehicles") %>% 
+    ggplot() +
+    aes(x = PeriodEnd, y = Value) +
+    geom_line(aes(y = mQCfreq0_fit[,1]), lwd = 1.5, color = "cornflowerblue") +
+    geom_ribbon(aes(ymin = mQCfreq0_fit[,2], ymax = mQCfreq0_fit[,3]), 
+                fill = "cornflowerblue", alpha = 0.4) +
+    geom_line(lwd = 1) + geom_point() + 
+    labs(x = "", y = "Claim frequency per 100 vehicles") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, vjust = 0.5),
+          panel.grid.minor.x = element_blank()) +
+    geom_vline(xintercept = DateCEffect, color = "gray50", linetype = "dashed") +
+    scale_x_date("",
+                 breaks = breaks_width("6 months", offset = -1),
+                 labels = format_quarters)
+```
+
+
+
+\FloatBarrier
+## United States
+
+### Propensity score matching
+
+Below are the matches for each decriminalized state:
+
+```{r}
+PropRatio = c(1, 3, 5)
+statevars <- c("Urbanization", "Population1000",
+               "VehicleMilesPerLicensedDriver", "RoadMilesPer1000Persons", 
+               "VehiclesPer1000")
+statefml <- as.formula(paste0("Legal ~ ", paste0(statevars, collapse = "+")))
+D <- left_join(USAm2, StateStat, by = "State") %>% 
+    filter(!is.na(Legal)) %>% # remove unused states
+    select(all_of(c("State", "Legal", statevars)))
+## vignette("matching-methods")
+Mout <- lapply(PropRatio, function(rat) {
+    set.seed(1234)
+    MatchIt::matchit(statefml, data = D,
+                     method = "nearest", ratio = rat,
+                     distance = "randomforest")})
+```
+
+
+```{r}
+Mout_matches <- lapply(Mout, function(m) {
+    tmpd <- match.data(m)
+    tapply(tmpd$State, tmpd$subclass, c)
+})
+# select states for which to compile detailed data:
+STATES <- lapply(Mout_matches, function(m) sort(unlist(m)))
+```
+
+* for the state of `r Mout_matches[[1]][[1]][1]`:
+    * `r sort(Mout_matches[[1]][[1]][-1])`
+    * `r sort(Mout_matches[[2]][[1]][-1])`
+    * `r sort(Mout_matches[[3]][[1]][-1])`
+* for the state of `r Mout_matches[[1]][[2]][1]`:
+    * `r sort(Mout_matches[[1]][[2]][-1])`
+    * `r sort(Mout_matches[[2]][[2]][-1])`
+    * `r sort(Mout_matches[[3]][[2]][-1])`
+* for the state of `r Mout_matches[[1]][[3]][1]`:
+    * `r sort(Mout_matches[[1]][[3]][-1])`
+    * `r sort(Mout_matches[[2]][[3]][-1])`
+    * `r sort(Mout_matches[[3]][[3]][-1])`
+
+
+```{r MatchDiff, fig.cap = "Standardized mean differences for propensity score matching with different ratios of selected control:treated states. The dashed line corresponds to the threshold of 0.25."}
+p <- lapply(Mout, function(m) love.plot(bal.tab(m, m.threshold = 0.25),
+                                        stat = "mean.diffs",
+                                        drop.distance = TRUE,
+                                        grid = TRUE,
+                                        shapes = c("circle", "triangle"),
+                                        colors = c("red", "cornflowerblue"),
+                                        stars = "raw",
+                                        abs = TRUE) + xlab("")
+)
+# remove some elements in the ggplots
+for (i in 1:length(PropRatio)) {
+    if (i > 1) {
+        p[[i]] <- p[[i]] + theme(axis.text.y = element_blank())
+    }
+    p[[i]] <- p[[i]] + labs(title = paste0("Ratio ", PropRatio[i], ":1"), tag = LETTERS[i])
+    if (i == median(1:length(PropRatio))) {
+        p[[i]] <- p[[i]] + xlab("Absolute standardized mean difference")
+    }
+}
+wrap_plots(p, guides = "collect")
+```
+
+
+**Conventional matching**
+
+```{r}
+set.seed(1234)
+rf_unsup <- randomForest::randomForest(D[,statevars], ntree = 500L, keep.forest = FALSE)
+SM <- rf_unsup$proximity # similarity matrix
+dimnames(SM) <- list(D$State, D$State)
+```
+
+```{r RFsm, fig.height=2, fig.cap = paste0("Random forest similarity matrix based on the ", length(statevars), " state variables.")}
+par(mar = c(0, 1, 1, 2) + 0.1,
+    mgp = c(2, 0.2, 0))
+# separate the groups
+n <- nrow(D)
+n1 <- nrow(states1)
+plot(SM[1:n1,],
+     key = list(side = 4, las = 1, font = 1, tick = FALSE),
+     border = NA,
+     axis.col = list(side = 3, las = 1, font = 1, tick = FALSE), # dates
+     axis.row = list(side = 2, las = 1, font = 1, tick = FALSE), # states
+     cex.main = 1, cex.lab = 1, cex.axis = 0.6,
+     xlab = "", ylab = "", main = "",
+     col = viridis(n = 10, begin = 0.1)
+)
+# abline(h = c(n - n1) + 0.5, lty = 2) # goes onto the legend
+lines(x = c(0, n + 0.5), y = c(n - n1, n - n1) + 0.5, lty = 2, col = "white")
+abline(v = n1 + 0.5, lty = 2, col = "white")
+```
+
+```{r}
+# 2023-09-30 try simpler distances
+SM_tmp <- dist(scale(D[,statevars]), upper = TRUE) %>% 
+    as.matrix()
+dimnames(SM_tmp) <- list(D$State, D$State)
+
+par(mar = c(0, 1, 1, 2) + 0.1,
+    mgp = c(2, 0.2, 0))
+# separate the groups
+n <- nrow(D)
+n1 <- nrow(states1)
+plot(SM_tmp[1:n1,],
+     key = list(side = 4, las = 1, font = 1, tick = FALSE),
+     border = NA,
+     axis.col = list(side = 3, las = 1, font = 1, tick = FALSE), # dates
+     axis.row = list(side = 2, las = 1, font = 1, tick = FALSE), # states
+     cex.main = 1, cex.lab = 1, cex.axis = 0.6,
+     xlab = "", ylab = "", main = "",
+     col = viridis(n = 10, begin = 0.1)
+)
+# abline(h = c(n - n1) + 0.5, lty = 2) # goes onto the legend
+lines(x = c(0, n + 0.5), y = c(n - n1, n - n1) + 0.5, lty = 2, col = "white")
+abline(v = n1 + 0.5, lty = 2, col = "white")
+```
+
+
+```{r}
+# Mout_matches[[1]] # record manual ones in the same format, select by sorting SM
+Mout_manmatches <- list(c("CA", "NJ"), # "FL", "VA"
+                        c("MA", "FL"), # "AZ", "NJ"
+                        c("NV", "UT")) # "KS", "AZ"
+```
+
+Similarities between states derived from a random forest (Figure \@ref(fig:RFsm)) were used to find alternative matches. Each state in the "Legalized" group was matched with the most similar state in the control group if the latter has not been used as a match: 
+
+* for the state of `r Mout_manmatches[[1]][1]`: `r sort(Mout_manmatches[[1]][-1])`
+* for the state of `r Mout_manmatches[[2]][1]`: `r sort(Mout_manmatches[[2]][-1])`
+* for the state of `r Mout_manmatches[[3]][1]`: `r sort(Mout_manmatches[[3]][-1])`
+
+
+```{r}
+USday <- readRDS("./dataderived/USA_daily_daymet_fars.rds")
+USreg <- read.csv("./dataraw/USA_statestats/mv1_combined.csv") %>% 
+    mutate(RegisteredVehicles = as.integer(RegisteredVehicles))
+USday <- USreg %>% 
+    right_join(USday, by = c("State", "Year")) %>% 
+    mutate(Nacc1m = 10^6 * Nacc / RegisteredVehicles,
+           Fatals1m = 10^6 * Fatals / RegisteredVehicles,
+           NFatAcc1m = 10^6 * NFatAcc / RegisteredVehicles)
+```
+
+
+```{r}
+library(rlang)
+effectplot <- function(matches, v = "Nacc1m", vname = NULL) {
+    if (is.null(vname)) {
+        if (v == "Nacc1m") {
+            vname <- "Number of accidents per million vehicles"
+        } else {
+            vname <- v
+        }
+    }
+    MatchPlots3 <- lapply(matches, function(X){ # X = matches3[[1]]
+        dlegal <- USAm2 %>%
+            filter(State == X[1]) %>%
+            pull(DateSalesEffect)
+        dl_year <- as.numeric(format(dlegal, "%Y"))
+        dl_mon <- as.numeric(format(dlegal, "%m"))
+        tmp <- USday %>%
+            filter(is.element(State, X)) %>%
+            group_by(State, Year, Month) %>%
+            # aggregate the variable of interest
+            summarise(V = mean((!!sym(v)))) %>%
+            mutate(Date = as.Date(paste(Year, Month, "01", sep = "-")))
+        # select portion of the legalized series (the legalized state is X[1])
+        tslegal <- tmp %>%
+            filter(is.element(State, X[1]), Year >= dl_year)
+        if (dl_mon > 1) {
+            tslegal <- tslegal[-c(1:(dl_mon - 1)),]
+        }
+        ggplot(tmp) +
+            aes(x = Date, y = V, group = State, color = State) +
+            geom_line(lwd = 1) +
+            labs(x = "", y = vname) +
+            theme_minimal() +
+            scale_color_viridis(discrete = TRUE) +
+            geom_vline(xintercept = dl_year + (dl_mon-1)/12, 
+                       color = "gray50", linetype = "dashed") +
+            geom_point(data = tslegal,
+                       mapping = aes(x = Date, y = V),
+                       size = 2, inherit.aes = FALSE) +
+            theme(axis.text.x = element_text(angle = 45, vjust = 0.5)) +
+            scale_x_date("",
+                         breaks = breaks_width("6 months", offset = 0),
+                         labels = format_months)
+    })
+}
+```
+
+### Estimates of the effects
+
+
+```{r}
+TableData = data.frame(
+  States = c("CA, WV", "MA, UT", "NV, NY", "CA, WV, MA, UT, NV, NY", "CA, NJ", "MA, FL", "NV, UT", "CA, NJ, MA, FL, NV, UT"),
+  `Fatality rate` = c("-0.032 (1.00)", "-0.026 (0.88)", "-0.015 (0.24)", "-0.011 (0.95)", "-0.014 (0.97)", "-0.066 (0.01)", "-0.015 (0.95)", "-0.012 (0.50)"),
+  `Rate of fatal accidents` = c("-0.015 (0.58)", "-0.020 (0.89)", "-0.018 (0.99)", "-0.009 (0.99)", "-0.015 (0.98)", "-0.060 (0.01)", "-0.012 (0.81)", "-0.012 (0.54)"),
+  `Rate of road accidents` = c("2.444 (0.01)", "--", "-0.387 (0.02)", "0.642 (0.01)", "1.196 (0.01)", "-0.943 (0.01)", "--", "0.321 (0.01)")
+)
+
+TableData %>% 
+  # as.data.frame() %>% 
+  # rownames_to_column() %>% 
+  flextable() %>% 
+  autofit() %>% 
+  set_caption("Estimates of the decriminalization effects based on regression random forests; Altmann's $p$-values are in parentheses. The last column of results excludes UT and uses subsets of $+-1$ year from the decriminalization date for other states", 
+  autonum = run_autonum(seq_id = "tab", bkm = "USeffects"))
+```
+
+
+```{r PDP-fat-psm, fig.pos = "!b", fig.height=5, fig.cap = "Partial dependence plots from the random forest model of fatality rate based on all propensity score-matched states (CA, WV, MA, UT, NV, NY). The inner tickmarks on the horizontal axis denote deciles of the corresponding variable; two-dimensional plots are restricted to the convex hull of the observed data to avoid extrapolation."}
+rp <- readRDS("./dataderived/ranplots_comPSM_Fatals.rds")
+wrap_plots(rp, ncol = 3)
+```
+
+
+```{r}
+# Add a table with stat summaries
+leg <- readRDS("./dataderived/USA_legalgrouped.rds")
+USday <- readRDS("./dataderived/USA_daily_daymet_fars.rds")
+USreg <- read.csv("./dataraw/USA_statestats/mv1_combined.csv", strip.white = TRUE) %>%
+    mutate(RegisteredVehicles = as.integer(RegisteredVehicles))
+USday <- USreg %>%
+    right_join(USday, by = c("State", "Year")) %>%
+    mutate(Nacc1m = 10^6 * Nacc / RegisteredVehicles,
+           Fatals1m = 10^6 * Fatals / RegisteredVehicles,
+           NFatAcc1m = 10^6 * NFatAcc / RegisteredVehicles)
+
+leg1 <- leg %>% filter(Legal == 1)
+USday$Legal <- FALSE
+for (i in 1:nrow(leg1)) {
+    legindex <- (USday$Date >= leg1$DateSalesEffect[i]) & (USday$State == leg1$State[i])
+    USday$Legal[legindex] <- TRUE
+}
+
+# aggregate within state
+USdaystate <- USday %>%
+    group_by(State, Date, Legal, Year, Month, Day, Weekday, Weekend, Holiday) %>%
+    summarise(sunriseH = mean(sunriseH),
+              sunsetH = mean(sunsetH),
+              DayLength = mean(DayLength),
+              Precip = mean(Precip, na.rm = TRUE),
+              Tmax = mean(Tmax, na.rm = TRUE),
+              Tmin = mean(Tmin, na.rm = TRUE),
+              Temp = mean(Temp, na.rm = TRUE),
+              Nacc1m = sum(Nacc1m),
+              Fatals1m = sum(Fatals1m),
+              NFatAcc1m = sum(NFatAcc1m),
+              RegisteredVehicles = mean(RegisteredVehicles)
+    ) %>%
+    mutate(Trange = Tmax - Tmin)
+
+STATES_psm <- list(c("CA", "WV"), c("MA", "UT"), c("NV", "NY"))
+STATES_man <- list(c("CA", "NJ"), c("MA", "FL"), c("NV", "UT"))
+Nacc_dates_psm <- data.frame(starts = as.Date(c("2017-01-01", NA, "2016-07-01")),
+                             ends = as.Date(c("2019-01-31", NA, "2018-07-31")))
+Nacc_dates_man <- data.frame(starts = as.Date(c("2017-01-01", "2017-11-01", NA)),
+                             ends = as.Date(c("2019-01-31", "2019-11-30", NA)))
+
+D <- USdaystate %>%
+    filter(is.element(State, c(unlist(STATES_psm), unlist(STATES_man)))) %>%
+    mutate(Legal = as.factor(Legal),
+           LegalState = interaction(State, Legal, drop = TRUE),
+           Month = as.factor(Month),
+           Weekday = as.factor(Weekday),
+           Weekend = as.factor(Weekend),
+           Holiday = as.factor(Holiday))
+
+predictors <- c("Legal", #"LegalState",
+                # "Airport_Code",
+                # "lat", "lon",
+                "State", #"DayLength",
+                "Month", #"Year",
+                "Weekday", #"Weekend",
+                "Holiday",
+                "Trange",
+                "Precip", "Temp")
+D %>%
+    ungroup() %>%
+    dplyr::select(all_of(c(#"RegisteredVehicles",
+                           predictors, "Fatals1m", "NFatAcc1m"))) %>%
+    select(-Month, -Weekday, -Holiday, -Legal, -State) %>%
+    psych::describeBy(group = D$State, mat = TRUE, fast = TRUE,
+                      quant = c(0.25, 0.5, 0.75)) %>%
+    select(group1, mean, sd, min, Q0.25, Q0.5, Q0.75, max, n) %>%
+    knitr::kable(digits = 3, longtable = TRUE)
+```
+
+
+```{r}
+D %>%
+    ungroup() %>%
+    dplyr::select(all_of(c("RegisteredVehicles"
+        ))) %>%
+    psych::describeBy(group = D$State, mat = TRUE, fast = TRUE,
+                      quant = c(0.25, 0.5, 0.75)) %>%
+    select(group1, mean, sd, min, Q0.25, Q0.5, Q0.75, max, n) %>%
+    knitr::kable(digits = 3, longtable = TRUE)
+```
+
+
+# References {-}
+
+```{r include=FALSE}
+# automatically create a bib database for R packages
+knitr::write_bib(c(
+    .packages(), 'base', # packages definitely used in the code above
+    'lutz', 'suncalc', 'timeDate', # extra packages used in external files
+    'bookdown', 'knitr', 'rmarkdown' # packages used to compile the file
+), 'refPackages.bib')
+
+```
+
+
+
